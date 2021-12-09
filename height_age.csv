@@ -1,0 +1,12 @@
+height, range, age,ageUnc,type, location, reference
+250,150,815.29,0.5,uniform," ""Ethiopia"""," ""Swanson-Hysell et al. (2015)"""
+430,40,811.51,0.25,normal," ""NW Canada"""," ""Macdonald et al. (2010)"""
+450,20,810.7,3.15,normal," ""NW Canada"""," ""Cohen et al. (2017)"""
+1125,200,788.7,0.47,uniform," ""Ethiopia"""," ""Swanson-Hysell et al. (2015)"""
+1675,100,775.1,0.5,uniform," ""NW Canada""","""Milton et al. (2017)"""
+1850,100,759.9,1.2,normal,"""Namibia""","""Halverson et al. (2005)"""
+1960,20,752.7,2.75,normal," ""NW Canada"""," ""Rooney et al. (2015)"""
+2060,10,737.5,4.8,normal," ""NW Canada""","""Millikin et al. (2022)"""
+2097,20,739.9,3.05,normal," ""NW Canada"""," ""Strauss et al. (2014)"""
+2175,40,735.25,0.44,normal," ""Ethiopia"""," ""MacLennan et al. (2018)"""
+2190,40,732.2,1.95,normal," ""NW Canada"""," ""Rooney et al. (2015)"""

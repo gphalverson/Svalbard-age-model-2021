@@ -1,0 +1,533 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Execute the code by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*. 
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+------------------------------------------------------------------
+
+This is a simple Bayesian subsidence model customized for Tonian succession in Svalbard. It should yield similar results to those in the manuscript by Halverson et al. (submitted Earth Science Frontiers, 10/2021)
+
+This code uses the Rethinking package by Richard McElreath, so before running it, you you may need first to install the "rethinking" package
+
+This version of the model uses a quadratic approximation (QUAP) to solve for the posterior, both to take into account uncertainty on ages and their stratigraphic positions within the Svalbard succession, as well as to implement the rule of superposition, it runs a bootstrapping routine to fill the final posterior with data based on many different combinations of ages/height positions. 
+
+
+```{r}
+graphics.off() # This closes all of R's graphics windows.
+rm(list=ls())  # Careful! This clears all of R's memory!
+```
+
+Now we need to load the necessary packages to run the codes, meaning you will need to install these packages if you haven't already.
+
+install.packages("rethinking")
+install.packages("dplyr")
+
+```{r}
+library(rethinking)
+library(dplyr)
+```
+
+Now we will load the data (which you need to have in the same folder as this file), sort it, and look at it just to make sure it looks OK
+
+```{r}
+hAgeDat <- read.csv("height_age.csv")
+dat <- select(hAgeDat, height, range, age, ageUnc, type) # Now select the columns we want
+dat <- arrange(dat, height) # Sort the data so it is easier to read
+print(dat)
+numdat <- nrow(dat)
+```
+
+We will also read in another csv files with the heights of interest for this study. These are basically the formation boundaries, along with the start and end of the Bitter Springs Anomaly. 
+
+```{r}
+plot_heights <- read.csv("plot_heights.csv")
+plot_heights <- arrange(plot_heights, height) # Sort the data to ensure that it is in order
+print(plot_heights) 
+l <- length(plot_heights$height)
+```
+
+Now we will plot the data now, with 95% error bars, along with the key boundaries of interest
+
+```{r fig.height = 6, fig.width = 8}
+# set the limits for plotting
+ymin <- signif((min(dat$age)), digits=1)
+ymax <- signif((max(dat$age)), digits=1)+50
+xmax <- signif((max(dat$height)), digits=1)+500
+# We'll plot the original data with error bars just to see what it looks like]
+
+# plot the original data
+plot(dat$height, dat$age, xlim=c(0, xmax), ylim=c(ymax, ymin),
+     xlab="Height (m)", ylab="Age (Ma)", main="Age versus Height", col=rgb(0,0,1), pch=1, cex=1.5, lwd=2)
+grid(nx=27, ny=23, col = "lightgray", lty = "dotted", lwd = par("lwd"))
+
+# plot error bars
+
+for ( i in 1:numdat ) {
+  ci_age <- dat$age[i] + c(-1,1)*dat$ageUnc[i]
+  if (dat$type[i] == "normal"){
+    ci_height <- dat$height[i] + c(-1,1)*dat$range[i]
+  } else {
+    ci_height <- dat$height[i] + c(-1,1)*dat$range[i]/2
+  }
+  x <- dat$height[i]
+  y <- dat$age[i]
+  lines( c(x,x) , ci_age, lwd=2, col=rgb(0,0,1))
+  lines( ci_height, c(y,y), lwd=2, col=rgb(0,0,1))
+}
+
+# the following code plots the key boundaries of interest
+for ( i in 1:l){
+  abline(v=plot_heights$height[i], lty=2)
+}
+
+```
+We have plotted the height uncertainties in the graph above at the 95% level so that it is comparable to the age uncertainty. Note that we are treating the height uncertainty as Gaussian. We have chosen a Gaussian probability density function (pdf) instead of uniform pdf because we've made the 'best guess' for the actual correlation of the ages to the Svalbard stratigraphy and assume the chances diminish away from this best guess, which is appropriate for tie-point uncertainties (Lougheed and Obrochta, 2019). Also, we want there to be a non-zero chance that this fit is incorrect beyond that uncertainty range. The 95% uncertainty will be accounted for in the bootstrapping routine, where the SD will equal half of the uncertainties shown in the table. 
+
+This code is set up to generate median ages and 95% credibility intervals for every 5 m of the stratigraphic column. This information will be exported as a csv file with the name "Age_Heights_Calibrated_bootmodel.csv". We might also like to generate more detailed plots for specific stratigraphic heights within the succession or heights at the metre scale, which can easily be implemented.  
+
+First we will define initial parameters for the thermal subsidence model, which are from Allen and Allen (2013). None of these parameters are treated as variable (that is, to be modeled here). However, it would be relatively straightforward to add these to the model. Note, some of these parameters are not actually used in the model but have been left in because they are used in other similar models. 
+
+```{r}
+y_c     = 35000   # Initial crustal thickness in m               [m]
+y_l     = 110000  # Initial lithospheric thickness in m          [m]
+rho_m0  = 3330    # Density of the mantle at 0 degrees C         [kg/m^3]
+rho_c0  = 2800    # Density of the crust at 0 degrees C          [kg/m^3]
+rho_w   = 1030    # Density of water                             [kg/m^3]
+rho_s   = 2600    # Density of sediments                         [kg/m^3]
+alpha_v = 3.28E-5 # Volumetric coefficient of thermal expansion  [1/K]
+Tm      = 1333    # Temperature of the mantle                    [C]
+kappa   = 1e-6   # Thermal diffusivity                          [m^2/s]
+
+# time_my = 0:150  # Time range                                    [my]
+time_s  = 365*24*3600*1e6        # Time in seconds
+
+#E0w      = 4*y_l*rho_m0*alpha_v*Tm/(pi^2*(rho_m0-rho_w)) # correction for water-loaded subsidence
+E0s      = 4*y_l*rho_m0*alpha_v*Tm/(pi^2*(rho_m0-rho_s)) # correction for sediment-loaded subsidence. This is what we are using here. 
+tau     = y_l^2/(pi^2*kappa) # Thermal decay constant
+```
+
+Here we will initialize the variables in the posterior and set up the bootstrapping procedure. The idea is that we will bootstrap the ages and heights for each of the samples prior to running a Bayesian analysis on each set of bootstrapped data. This allows us to incorporate age and height uncertainty in a way that enforces superposition and allows rejection of samples that do not obey. We will also define priors for beta (stretching factor) and onset of thermal subsidence (i.e. base of Akademikerbreen) based on values in Halverson et al. (2018). After the first Bayesian fit, the median values of the posterior distributions will be used. 
+
+I have set this up to run 5000 iterations. The following code just initializes the necessary variables. I also have used the set.seed function to provide results consistent with those reported in the manuscript.  
+
+```{r}
+beta_prior <- 1.3 # based on Halverson et al. (2018)
+beta_prior_sigma <- 0.2 # a loosely prescribed prior. See also Figure 5 in main text
+drift_prior <- 817 # based on Halverson et al. (2018)
+drift_prior_sigma <- 5 # a loosely prescribed prior
+sigma_prior <- 10 # a loosely prescribed prior
+
+set.seed(150)
+
+bootnumber <- 7500  # this is the number of samples we want in the posterior (i iterations)
+post <- data.frame(matrix(ncol=3,nrow=bootnumber)) # this sets up a dataframe to hold the posterior values 
+colnames(post) = c("a","b","sigma")
+boot_heights <- vector("numeric") # to store the bootstrapped heights
+boot_ages <- vector("numeric")  # to store the bootstrapped ages
+agey <- vector("numeric")
+heightx <- vector("numeric")
+```
+
+Now for the routine. The way this works is that it will run <bootnumber> iterations, sampling randomly from the age and height distributions we've provided for each distribution, then running a Bayesian analysis (a quadratic approximation) for each data set and adding the a randomly selected result from the individual posterior distribution to the 'composite' posterior distribution, stored in a dataframe. 
+
+```{r}
+
+for (i in 1:bootnumber){
+
+# Initialize the dataframe for each bootstrap session
+boot_frame <- data.frame(matrix(ncol=2, nrow=numdat))
+colnames(boot_frame) <- c("height", "age")
+  
+  for (j in 1:numdat){
+    boot_frame$age[j] <- rnorm(1, mean=dat$age[j], sd=dat$ageUnc[j]/2)
+    if (dat$type[j] == "normal"){
+    boot_frame$height[j] <- rnorm(1, mean=dat$height[j], sd=dat$range[j]/2)
+    } else {
+      boot_frame$height[j] <- runif(1, min=(dat$height[j]-dat$range[j]/2), max=(dat$height[j]+dat$range[j]/2))
+    }
+  }
+
+# Now ensure that all of the all of the samples obey superposition. Note that this is different from some other Bayesian models, which would reject any combination of heights/ages in which one age is out of place. Here, we want to keep all of the data points that do obey, because otherwise, due to large uncertainties on certain ages that lie close to each other, this would make most randomly chosen sample combinations invalid. But also, from a geological perspective, this approach allows for disregarding correlated age-height ages that are inaccurate.
+
+# In order to weed out disobeying data points, we need to cycle through the bootstrapped data and simply compare adjacent data points. This routine might need to be modified for a scenario where there are more closely spaced data. 
+
+# First we will order the data by height
+
+age_boot <- vector("numeric")
+height_boot <- vector("numeric") # initialize the vectors that will be used in bootstrapping
+boot_frame <- arrange(boot_frame, height)
+counter <- 1
+
+
+# Now we will set this up to run in opposite directions on alternate iterations so that it doesn't preferentially exclude one data point every time. Basically for odd numbers of 'i' in the 'for' sequence, the algorithm starts with the lowest stratigraphic level then cycles up section. Then for even numbers of 'i', it starts with the highest sample and works down section. 
+
+if(i %% 2 != 0){
+  height_boot[counter] <- boot_frame$height[counter]
+  age_boot[counter] <- boot_frame$age[counter]
+  counter <- counter+1
+  for (j in 2:numdat){
+    if (boot_frame$age[j] < boot_frame$age[j-1]){
+      height_boot[counter] <- boot_frame$height[j]
+      age_boot[counter] <- boot_frame$age[j]
+      counter <- counter+1 
+      }
+  }
+} else {
+  height_boot[counter] <- boot_frame$height[numdat]
+  age_boot[counter] <- boot_frame$age[numdat]
+  counter <- counter+1
+    for (j in numdat:2){
+      if (boot_frame$age[j-1] > boot_frame$age[j]){
+        height_boot[counter] <- boot_frame$height[j-1]
+        age_boot[counter] <- boot_frame$age[j-1]
+        counter <- counter+1 
+      }
+    }
+  i1 <- order(height_boot)
+  height_boot <- height_boot[i1]
+  age_boot <- age_boot[i1]
+}
+
+boot_heights <- append(boot_heights, height_boot) # store the bootstrapped heights for plotting later
+boot_ages <- append(boot_ages, age_boot) # store the bootstrapped ages for plotting later
+
+# Now put the bootstrapped data into a single dataframe, which will be fed to the quadratic approximation (quap) model
+
+bootdat <- expand.grid(height=height_boot) 
+bootdat <- cbind(bootdat, age=age_boot)
+
+# Now do a quadratic Bayesian fit. Note that the start values have been fixed. If these vary too much, quap won't run... 
+
+mLin <- quap(
+  alist(
+    age ~ dnorm(mu,sigma),
+    mu <- a + tau/time_s*log(1-(height/E0s*pi/b)/sin(pi/b)),
+    a ~ dnorm(drift_prior,drift_prior_sigma),
+    b ~ dnorm(beta_prior,0.2),
+    sigma ~ dunif(0,10)
+  ),
+  start=list(a=817.5, b=1.29, sigma=3),
+  data=bootdat
+  )
+
+# precis(mLin, prob=0.95) # if you want to look at a summary of the results
+
+post1 <- extract.samples(mLin, n=1)
+post1 <- as.data.frame(t(post1))
+post1 <- as.numeric(post1[1,])
+post[i,] <- post1
+
+# We'll set our next prior based on the current posterior. Not that we do not yet use the uncertainties for the priors. The reason is that this causes the uncertainty to shrink progressively, which is not realistic or what we are aiming for. 
+
+# cf <- as.data.frame(precis(mLin)) # use this code if you want to put the precis values into a data.frame
+drift_prior <- post1[1]
+beta_prior <- post1[2]
+
+
+}
+
+```
+
+Now we will plot a series of viable curves (in gray) for different sets of bootstrapped data, along with the bootstrapped data points themselves (in red), and finally the original data and uncertainties. Note that the way the model is set up, each curve that is plotted is not based on the mean of the parameters issued by each individual Bayesian analysis, but rather is a random sample from the parameter posterior distributions. This provides a more plausible spread in possible values for these parameters, hence a more realistic HPDI. The approach doesn't have any real effect on the median values of the parameters. On rare occasions some of the fits are quite extreme and produces NaNs. However, even in this event, the data should plot. 
+
+```{r fig.height = 6, fig.width = 8}
+# And plot some results and the original data
+plot(NULL, xlim=c(0, xmax), ylim=c(ymax, ymin),
+     xlab="Height (m)", ylab="Age (Ma)", main="Age versus Height", pch=1, cex=1.5, lwd=2)
+grid(nx=27, ny=23, col = "lightgray", lty = "dotted", lwd = par("lwd"))
+
+for (i in 1:bootnumber){
+  curve(post$a[(i-1)*10+1]+tau/time_s*log(1-(x/E0s*pi/post$b[(i-1)*10+1])/sin(pi/post$b[(i-1)*10+1])), 0, 2300, lwd=1, col=rgb(0.9,0.9,0.9,0.5), add=TRUE)
+}
+
+# plot the bootstrapped points onto plot
+points(boot_heights, boot_ages, pch=46, col=rgb(1,0,0,0.4), cex=2)
+
+# plot the original data and uncertainties 
+points(dat$height, dat$age, xlim=c(0, xmax), ylim=c(ymax, ymin),
+     xlab="Height (m)", ylab="Age (Ma)", main="Age versus Height", pch=1, cex=1.5, lwd=2, col=rgb(0,0,1,0.8))
+
+# error bars
+for ( i in 1:numdat ) {
+  ci_age <- dat$age[i] + c(-1,1)*dat$ageUnc[i]
+  if (dat$type[i] == "normal"){
+    ci_height <- dat$height[i] + c(-1,1)*dat$range[i]
+  } else {
+    ci_height <- dat$height[i] + c(-1,1)*dat$range[i]/2
+  }
+  x <- dat$height[i]
+  y <- dat$age[i]
+  lines( c(x,x) , ci_age, lwd=2, col=rgb(0,0,1,0.8))
+  lines( ci_height, c(y,y), lwd=2, col=rgb(0,0,1,0.8))
+}
+
+```
+This Figure shows the posterior fits (gray lines) to the bootstrapped data (red dots), superposed on the original sample data and uncertainties. 
+
+Here we summarize the 'composite' posterior data. Note that we use the median rather than the mean since some distributions will not be perfectly Guassian. 
+
+```{r}
+a_median<- median(post$a)
+a_HPDI <- HPDI(post$a, prob=0.95)
+a_plus <- a_HPDI[2] - a_median
+a_minus <- a_median - a_HPDI[1]
+b_median <- median(post$b)
+b_HPDI <- HPDI(post$b, prob=0.95)
+b_plus <- b_HPDI[2] - b_median
+b_minus <- b_median - b_HPDI[1]
+```
+
+Here we look at the posterior distributions of our y-intercept (= onset of rifting, or rift-drift transition) and beta parameters.
+
+```{r}
+hist(post$b, breaks = 30, main = NULL, xlab="beta", ylab=NULL, yaxt = "n" )
+  title("Posterior beta", adj = 0.05, line = -2)
+abline(v=b_median, col="red", lwd=2)
+abline(v=b_HPDI[1], col="blue", lty=2)
+abline(v=b_HPDI[2], col="blue", lty=2)
+mtext(side=3, at=b_median,
+     paste(round(b_median, 2), " +", round((b_HPDI[2]-b_median),2), "/-", round((b_median-b_HPDI[1]),2)),
+     col = "red",
+     cex = 1)
+```
+```{r}
+
+hist(post$a, breaks = 30, main = NULL, xlab="age of rift-drift transition", ylab=NULL, yaxt = "n")
+  title("Posterior rift-drift", adj = 0.05, line = -2)
+abline(v=a_median, col="red", lwd=2)
+abline(v=a_HPDI[1], col="blue", lty=2)
+abline(v=a_HPDI[2], col="blue", lty=2)
+mtext(side=3, at=a_median,
+     paste(round(a_median, 2), " +", round((a_HPDI[2]-a_median),2), "/-", round((a_median-a_HPDI[1]),2), " Ma"),
+     col = "red",
+     cex = 1)
+
+```
+
+And here we set up these results to be added to the legend of the next figure
+
+```{r}
+beta <- round(b_median, 2) %>% as.character
+betap <- round(b_plus, 2) %>% as.character
+betam <- round(b_minus, 2) %>% as.character
+a <- round(a_median, 2) %>% as.character
+ap <- round(a_plus, 2) %>% as.character
+am <- round(a_minus, 2) %>% as.character
+```
+
+
+This routine calculates an age and uncertainty for every meter (or 5 m) in the stratigraphic column and exports a file with this information
+```{r}
+height.num <- 2130 # This is the height for the top of the Russøya Formation
+spacing = 5 # m
+HPDI_matrix <- matrix(nrow=2, ncol=(height.num/spacing+1))
+height.seq <- seq( from=0, to=height.num, by=spacing)
+AgeHeight <- as.data.frame(height.seq, colnames = "height")
+colnames(AgeHeight)[colnames(AgeHeight) == "height.seq"] <- "height"
+
+for (i in 1:(height.num/spacing+1)){
+  mu <- post$a+tau/time_s*log(1-(height.seq[i]/E0s*pi/post$b)/sin(pi/post$b))
+  mu.median <- median(mu)
+  mu.HPDI <- HPDI(mu, prob=0.95)
+  HPDI_matrix[1,i] <- mu.HPDI[1]
+  HPDI_matrix[2,i] <- mu.HPDI[2]
+  AgeHeight$age_median[i] <- round(mu.median,2)
+  AgeHeight$age_min[i] <- round(mu.HPDI[1],2)
+  AgeHeight$age_max[i] <- round(mu.HPDI[2], 2)
+  AgeHeight$plus[i] <- round((mu.HPDI[2]-mu.median),2)
+  AgeHeight$minus[i] <- round((mu.median-mu.HPDI[1]),2)
+}
+  
+write.csv(AgeHeight, "Age_Heights5m_Calibrated_bootmodel.csv")
+```
+
+The following routine is similar but generates the ages and uncertainties for every height for which we have data
+```{r}
+dset <- read.csv('Svalbard_composite.csv')
+# clean it up and sort it
+dset <- na.omit(dset)
+dset <- arrange(dset, height) # Sort the data to ensure that it is in order
+len_dset <- length(dset$height)
+
+for (i in 1:(len_dset)){
+  mu <- post$a+tau/time_s*log(1-(dset$height[i]/E0s*pi/post$b)/sin(pi/post$b))
+  mu.median <- median(mu)
+  mu.HPDI <- HPDI(mu, prob=0.95)
+  dset$age_median[i] <- round(mu.median,2)
+  dset$age_min[i] <- round(mu.HPDI[1],2)
+  dset$age_max[i] <- round(mu.HPDI[2], 2)
+}
+
+write.csv(dset, "Svalbard_composite_with-ages.csv")
+```
+
+The following imports the heights for the Sr isotope data composite from Svalbard and generates ages and uncertainties for each data point
+```{r}
+Srdset <- read.csv('Sr_composite.csv')
+Srdset <- arrange(Srdset, height) # Sort the data to ensure that it is in order
+len_dset <- length(Srdset$height)
+
+for (i in 1:(len_dset)){
+  mu <- post$a+tau/time_s*log(1-(Srdset$height[i]/E0s*pi/post$b)/sin(pi/post$b))
+  mu.median <- median(mu)
+  mu.HPDI <- HPDI(mu, prob=0.95)
+  Srdset$age_median[i] <- round(mu.median,2)
+  Srdset$age_min[i] <- round(mu.HPDI[1],2)
+  Srdset$age_max[i] <- round(mu.HPDI[2], 2)
+}
+
+write.csv(Srdset, "Sr_composite_with-ages.csv")
+```
+
+
+Now plot the original data again with the posterior fit. 
+
+```{r fig.height = 4, fig.width = 6}
+# plot the original data
+plot(dat$height, dat$age, xlim=c(0, xmax), ylim=c(ymax, ymin),
+     xlab="Height (m)", ylab="Age (Ma)", main="Age versus Height", pch=1, cex=1.5, lwd=2, col=rgb(0,0,1,0.5))
+
+# plot error bars
+for ( i in 1:numdat ) {
+  ci_age <- dat$age[i] + c(-1,1)*dat$ageUnc[i]
+  if (dat$type[i] == "normal"){
+    ci_height <- dat$height[i] + c(-1,1)*dat$range[i]
+  } else {
+    ci_height <- dat$height[i] + c(-1,1)*dat$range[i]/2
+  }
+  x <- dat$height[i]
+  y <- dat$age[i]
+  lines( c(x,x) , ci_age, lwd=2, col=rgb(0,0,1,0.5))
+  lines( ci_height, c(y,y), lwd=2, col=rgb(0,0,1,0.5))
+}
+
+lines(AgeHeight$height, AgeHeight$age_median)
+lines(AgeHeight$height, AgeHeight$age_min, col="lightgrey")
+lines(AgeHeight$height, AgeHeight$age_max, col="lightgrey")
+shade(HPDI_matrix, height.seq)
+points(heightx, agey, pch=46, col="red", cex=2)
+
+# now I will add some vertical lines for the formation boundaries and the beginning and end of the Bitter Springs anomaly
+abline(v=0, lwd=2)
+abline(v=462, col="purple", lty=2, lwd=2)
+abline(v=660)
+abline(v=780.2, col="purple", lty=2, lwd=2)
+abline(v=1126)
+abline(v=1439.6)
+abline(v=1894.1, col="green", lty=3, lwd=2)
+abline(v=1961, lwd=2)
+abline(v=2094, col="purple", lty=2, lwd=2)
+abline(v=2130, lwd=2, col="red")
+betab <- paste("Beta =", beta, "+", betap, "/ -", betam, sep = " ")
+ir <- paste("Rift-Drift =", a, "+", ap, "/ -", am, "Ma", sep = " ")
+legend(x=0,y=725,c(betab, ir))
+
+
+```
+This Figure shows the posterior (median) fit and its 95% credibility envelope. Vertical lines correspond to stratigraphic heights of particular interest: solid black lines are formation boundaries; dashed purple lines are the onset and end of the BSA; the dashed green line is the base of the Kinnvika Member (marking the end of the stable carbonate platform); the heavy black line is the top of the Akademikebreen Group; the red line is the top of the Russøya Member/base of the Cryogenian Petrovbreen Member.  
+
+And we can plot the posterior age distribution for any height in the stratigraphc column. Here plot the ages for each of the vertical lines in the preceding figure on a single panel. 
+
+```{r fig.height = 8, fig.width = 8}
+nc <- round(l/3+0.49)
+par(mfrow=c(nc,3))
+
+for (k in 1:l){
+  mu_temp <- post$a+tau/time_s*log(1-(plot_heights$height[k]/E0s*pi/post$b)/sin(pi/post$b))
+  mu_median <- median(mu_temp)
+  mu_HPDI <- HPDI(mu_temp, prob=0.95)
+  plus <- round((mu_HPDI[2]-mu_median), 2) %>% as.character
+  minus <- round((mu_median-mu_HPDI[1]), 2) %>% as.character
+  main_label <- paste(as.character(plot_heights$height[k]), " m")
+  hist(mu_temp, breaks = 20, main=NULL, xlab="age (Ma)", ylab=NULL, yaxt = "n")
+  title(main_label, adj = 0.05, line = -2)
+  abline(v=mu_median, col="red", lwd=2)
+  abline(v=mu_HPDI[1], col="blue", lty=2)
+  abline(v=mu_HPDI[2], col="blue", lty=2)
+  mtext(side=3, at=mu_median,
+     paste(round(mu_median, 2), " +", plus, "/-", minus, " Ma"),
+     col = "red",
+     cex = 1)
+}
+par(mfrow=c(1,1))
+```
+This figure shows the posterior age distributions for each of the heights shown by the vertical lines in the previous figure. Vertical red lines are the mean ages and the dashed blue lines are the 95% credibility limits. 
+
+OK, now we use these results to estimate the duration of the Bitter Springs anomaly. This isn't as simple as it might at first seem. One might think we could just randomly sample from each of the two distributions, subtract the differences, and compile a sufficiently large sample to estimate difference and uncertainty. We'll do this first, but really, if you accept the model, this isn't the right way to do it, because any two ages should be strongly correlated, and we won't get correlated ages if we randomly sample from each distribution. So the better approach is to calculate the age difference from each posterior distribution. 
+
+Model 1:
+```{r}
+BSA_start <- post$a+tau/time_s*log(1-(plot_heights$height[1]/E0s*pi/post$b)/sin(pi/post$b))  
+BSA_end <- post$a+tau/time_s*log(1-(plot_heights$height[3]/E0s*pi/post$b)/sin(pi/post$b))
+BSA_diff <- vector("numeric")
+
+for (k in 1:10000){
+  BSA_diff[k] <- sample(BSA_start, 1)-sample(BSA_end, 1)
+}
+median_BSA_diff <- median(BSA_diff)
+HPDI_BSA_diff <- HPDI(BSA_diff, prob=0.95)
+plus <- round((HPDI_BSA_diff[2]-median_BSA_diff), 2) %>% as.character
+minus <- round((median_BSA_diff-HPDI_BSA_diff[1]), 2) %>% as.character
+hist(BSA_diff, breaks=30, main=NULL, xlab="Time (My)", ylab=NULL, yaxt = "n")
+abline(v=median(BSA_diff), col="red", lwd=2)
+abline(v=HPDI_BSA_diff[1], col="blue", lty=2)
+abline(v=HPDI_BSA_diff[2], col="blue", lty=2)
+mtext(side=3, at=median_BSA_diff,
+     paste(round(median_BSA_diff, 2), " +", plus, "/-", minus, " Ma"),
+     col = "red",
+     cex = 2)
+
+```
+That's a large uncertainty. Too large. The more appropriate way to infer the age uncertainty for the duration of the BSA is shown in the code and histogram below. Note the median isn't that different from the previous example, but the uncertainty is over an order of magnitude better. Importantly, this is what we want in this case, because the ages for the onset and end of the BSA are strongly correlated, such that if one model output pushes one age in one direction, it will also push the other age in that direction by a similar magnitude. 
+
+```{r}
+BSA_diff <- BSA_start - BSA_end
+median_BSA_diff <- median(BSA_diff)
+HPDI_BSA_diff <- HPDI(BSA_diff, prob=0.95)
+plus <- round((HPDI_BSA_diff[2]-median_BSA_diff), 2) %>% as.character
+minus <- round((median_BSA_diff-HPDI_BSA_diff[1]), 2) %>% as.character
+hist(BSA_diff, breaks=30, main=NULL, xlab="Time (My)", ylab=NULL, yaxt = "n")
+abline(v=median(BSA_diff), col="red", lwd=2)
+abline(v=HPDI_BSA_diff[1], col="blue", lty=2)
+abline(v=HPDI_BSA_diff[2], col="blue", lty=2)
+mtext(side=3, at=median_BSA_diff,
+     paste(round(median_BSA_diff, 2), " +", plus, "/-", minus, " Ma"),
+     col = "red",
+     cex = 2)
+```
+This figure shows the best estimate for duration of the Bitter Springs anomaly. 
+
+References:
+
+Allen, P.A. and Allen, J.R., 2013. Basin Analysis: Principles and Applications to Petroleum Play Assessment (3rd Edition). Wiley-Blackwell, 632 pp. 
+
+Halverson, G. P., Porter, S. M., Gibson, T. M., 2018. Dating the late Proterozoic stratigraphic record. Emerging Topics in Life Science 2, 137-147.
+
+Lougheed, B., Obrochta, S. P., 2019. A rapid, deterministic age-depth modeling routine for geological sequences with inherent depth uncertainty. Paleoceanography and Paleoclimatology 34, 122–133.
+
+McElreath, R., 2020. Statistical Rethinking: A Bayesian Course with Examples in R and Stan, Second Edition. Chapman and Hall/CRC (Boca Raton), 612 pp. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
